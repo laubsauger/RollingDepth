@@ -26,3 +26,7 @@
 *.mexa64
 *.pdf
 *.tar
+
+diffusers/
+.lh/
+.DS_Store

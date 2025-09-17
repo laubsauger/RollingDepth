@@ -29,6 +29,14 @@ from torchvision.transforms.functional import resize
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
+# Helper function for cross-platform memory management
+def clear_memory_cache():
+    """Clear memory cache based on available device type (CUDA/MPS)."""
+    if torch.cuda.is_available():
+        clear_memory_cache()
+    elif torch.backends.mps.is_available() and hasattr(torch.mps, 'empty_cache'):
+        torch.mps.empty_cache()
+
 from diffusers import (
     AutoencoderKL,  # type: ignore
     DDIMScheduler,  # type: ignore
@@ -149,7 +157,7 @@ class RollingDepthPipeline(DiffusionPipeline):
             unload_snippet=unload_snippet,
         )
 
-        torch.cuda.empty_cache()  # clear vram cache
+        clear_memory_cache()  # clear vram cache
 
         # ----------------- Resize back -----------------
         if restore_res:
@@ -276,7 +284,7 @@ class RollingDepthPipeline(DiffusionPipeline):
         if 1 != B:
             raise NotImplementedError("Layered inference is only implemented for B=1")
 
-        torch.cuda.empty_cache()
+        clear_memory_cache()
 
         # Use the same for every frame
         init_noise = torch.randn(
@@ -317,7 +325,7 @@ class RollingDepthPipeline(DiffusionPipeline):
         depth_coaligned /= depth_coaligned.max()
         depth_coaligned = depth_coaligned * 2.0 - 1.0
 
-        torch.cuda.empty_cache()
+        clear_memory_cache()
 
         # ----------------- Refinement -----------------
         if refine_step > 0:
@@ -457,7 +465,7 @@ class RollingDepthPipeline(DiffusionPipeline):
             )
 
             snippet_pred_ls.append(triplets_decoded)
-            torch.cuda.empty_cache()
+            clear_memory_cache()
         # <<< Go through dilations <<<
         return snippet_pred_ls
 
@@ -735,7 +743,7 @@ class RollingDepthPipeline(DiffusionPipeline):
             if unload_snippet:
                 stacked = stacked.cpu()
             decoded_outputs.append(stacked)
-            torch.cuda.empty_cache()  # clear vram cache
+            clear_memory_cache()  # clear vram cache
         all_decoded = torch.cat(decoded_outputs, dim=0)
 
         # mean of output channels

@@ -263,11 +263,15 @@ def concatenate_videos_horizontally_torch(
         if gap_color is None:
             gap_color = [0, 0, 0]  # Default to black
 
+        # Create gap tensor with proper dtype handling
         gap_tensor = torch.ones(
             (N, C, H1, gap),
             dtype=video1.dtype,
             device=video1.device,
-        ) * torch.tensor(gap_color).int().view(3, 1, 1)
+        )
+        # Convert gap_color to appropriate dtype
+        gap_color_tensor = torch.tensor(gap_color, dtype=video1.dtype, device=video1.device).view(1, 3, 1, 1)
+        gap_tensor = gap_tensor * gap_color_tensor
 
         # Concatenate with gap
         concatenated = torch.cat([video1, gap_tensor, video2_resized], dim=3)

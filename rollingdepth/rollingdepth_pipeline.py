@@ -21,7 +21,7 @@
 import logging
 import time
 from os import PathLike
-from typing import Dict, List, Union
+from typing import Dict, List, Union, Tuple
 
 import einops
 import torch
@@ -48,6 +48,7 @@ from diffusers.utils import BaseOutput  # type: ignore
 
 from .depth_aligner import DepthAligner
 from .video_io import load_video_frames
+from .cross_frame_attention import set_cross_frame_attention_processor
 
 
 class RollingDepthOutput(BaseOutput):
@@ -79,6 +80,13 @@ class RollingDepthPipeline(DiffusionPipeline):
             text_encoder=text_encoder,
             tokenizer=tokenizer,
         )
+
+        # Enable cross-frame attention processor
+        try:
+            set_cross_frame_attention_processor(self.unet)
+            logging.info("Cross-frame attention processor enabled")
+        except Exception as e:
+            logging.warning(f"Could not set cross-frame processor: {e}")
 
         self.empty_text_embed: torch.Tensor = None  # type: ignore
 
@@ -312,7 +320,7 @@ class RollingDepthPipeline(DiffusionPipeline):
 
         # Get snippets
         t_inference_start = time.time()
-        snippet_pred_ls = self.init_snippet_infer(
+        snippet_pred_ls, snippet_indices_ls = self.init_snippet_infer(
             rgb_latent=rgb_latent,
             init_noise=init_noise,
             dilations=dilations,
@@ -337,7 +345,7 @@ class RollingDepthPipeline(DiffusionPipeline):
             **coalign_kwargs,
         )
         (depth_coaligned, scales, translations, loss_history) = depth_aligner.run(
-            snippet_ls=snippet_pred_ls, dilations=dilations
+            snippet_ls=snippet_pred_ls, dilations=dilations, seq_len=seq_len, snippet_indices=snippet_indices_ls
         )
 
         # Re-normalize
@@ -397,7 +405,7 @@ class RollingDepthPipeline(DiffusionPipeline):
         max_vae_bs: int,
         unload_snippet: bool,
         verbose: bool,
-    ) -> List[torch.Tensor]:
+    ) -> Tuple[List[torch.Tensor], List[List[List[int]]]]:
         device = self.device
 
         B, seq_len, _, h, w = rgb_latent.shape  # latent shape
@@ -409,6 +417,7 @@ class RollingDepthPipeline(DiffusionPipeline):
 
         # Output
         snippet_pred_ls = []
+        snippet_indices_ls = []  # Store indices for each dilation level
 
         # >>> Go through dilations >>>
         iterable_init_infer = zip(dilations, snippet_lengths, strides, init_infer_steps)
@@ -489,9 +498,10 @@ class RollingDepthPipeline(DiffusionPipeline):
             )
 
             snippet_pred_ls.append(triplets_decoded)
+            snippet_indices_ls.append(snippet_idx_ls)  # Store the indices
             clear_memory_cache()
         # <<< Go through dilations <<<
-        return snippet_pred_ls
+        return snippet_pred_ls, snippet_indices_ls
 
     @staticmethod
     def get_snippet_indice(
@@ -685,11 +695,13 @@ class RollingDepthPipeline(DiffusionPipeline):
         unet_input = torch.cat([rgb_latent, depth_latent], dim=1)  # [N, 8, h, w]
 
         # predict the noise residual
+        # Pass num_view through cross_attention_kwargs for Diffusers 0.35+
+        cross_attention_kwargs = {"num_view": num_view}
         noise_pred = self.unet(
             unet_input,
             timestep,
             encoder_hidden_states=encoder_hidden_states,
-            num_view=num_view,
+            cross_attention_kwargs=cross_attention_kwargs,
         ).sample  # [(B N) 4 h w]
 
         noise_pred = einops.rearrange(

@@ -46,8 +46,10 @@ def colorize_depth_multi_thread(
     color_map: str = "Spectral",
     verbose: bool = False,
 ) -> np.ndarray:
-    depth = depth.squeeze(1)
-    assert 3 == depth.ndim
+    # Handle both 3D and 4D input
+    if depth.ndim == 4 and depth.shape[1] == 1:
+        depth = depth.squeeze(1)  # (N, 1, H, W) -> (N, H, W)
+    assert 3 == depth.ndim, f"Expected 3D tensor after squeeze, got shape {depth.shape}"
 
     n_frame = depth.shape[0]
 

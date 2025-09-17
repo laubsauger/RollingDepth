@@ -537,6 +537,15 @@ if "__main__" == __name__:
 
             depth_pred = pipe_out.depth_pred  # [N 1 H W]
 
+            # Debug: Check if depth_coaligned has all frames
+            if args.verbose and hasattr(pipe_out, 'depth_coaligned'):
+                logging.info(f"depth_coaligned shape: {pipe_out.depth_coaligned.shape}")
+
+            # Use depth_coaligned if it has more frames than depth_pred
+            if hasattr(pipe_out, 'depth_coaligned') and pipe_out.depth_coaligned.shape[0] > depth_pred.shape[0]:
+                logging.info(f"Using depth_coaligned with {pipe_out.depth_coaligned.shape[0]} frames instead of depth_pred with {depth_pred.shape[0]} frames")
+                depth_pred = pipe_out.depth_coaligned
+
             os.makedirs(output_dir, exist_ok=True)
 
             # Save prediction as npy
@@ -568,14 +577,23 @@ if "__main__" == __name__:
             for i_cmap, cmap in enumerate(args.color_maps):
                 if "" == cmap:
                     continue
+
+                # Debug: Check depth_pred shape before colorization
+                if args.verbose:
+                    logging.info(f"depth_pred shape before colorize: {depth_pred.shape}")
+
                 colored_np = colorize_depth_multi_thread(
-                    depth=depth_pred.numpy(),
+                    depth=depth_pred.numpy(),  # Shape: (N, 1, H, W) - colorize will squeeze internally
                     valid_mask=None,
                     chunk_size=4,
                     num_threads=4,
                     color_map=cmap,
                     verbose=args.verbose,
                 )  # [n h w 3], in [0, 255]
+
+                # Debug: Check colored_np shape after colorization
+                if args.verbose:
+                    logging.info(f"colored_np shape after colorize: {colored_np.shape}")
                 save_to = output_dir.joinpath(f"{video_path.stem}_{cmap}.mp4")
 
                 write_video_from_numpy(
@@ -587,43 +605,77 @@ if "__main__" == __name__:
                     verbose=args.verbose,
                 )
 
-                # Save side-by-side videos
+                # Save side-by-side videos - AFTER individual videos are written
                 if args.save_sbs and 0 == i_cmap:
-                    rgb = pipe_out.input_rgb * 255  # [N 3 H W]
-                    colored_depth = einops.rearrange(
-                        torch.from_numpy(colored_np), "n h w c -> n c h w"
-                    )
-
-                    # Debug: Check shapes
-                    if args.verbose:
-                        logging.info(f"RGB shape: {rgb.shape}, Colored depth shape: {colored_depth.shape}")
-
-                    # Ensure both have same dimensions
-                    if rgb.shape[2:] != colored_depth.shape[2:]:
-                        # Resize RGB to match colored depth dimensions
-                        from torchvision.transforms.functional import resize
-                        rgb = resize(rgb, list(colored_depth.shape[2:]), antialias=True)
+                    try:
                         if args.verbose:
-                            logging.info(f"Resized RGB to: {rgb.shape}")
+                            logging.info("=" * 60)
+                            logging.info("Starting RGBD side-by-side generation")
+                            logging.info("=" * 60)
 
-                    concat_video = (
-                        concatenate_videos_horizontally_torch(
-                            rgb, colored_depth, gap=10
+                        # Get the RGB input - should be in [0, 1] range
+                        rgb_normalized = pipe_out.input_rgb  # [N 3 H W], in [0, 1]
+
+                        # Convert RGB to 0-255 range and normalize to use full range
+                        rgb = (rgb_normalized * 255.0).float()
+                        # Normalize RGB to use full [0, 255] range since it's limited
+                        rgb_min = rgb.min()
+                        rgb_max = rgb.max()
+                        if rgb_max > rgb_min:
+                            rgb = (rgb - rgb_min) / (rgb_max - rgb_min) * 255.0
+
+                        # Get colored depth - it's already uint8 in [0, 255]
+                        colored_depth_np = colored_np.astype(np.float32)  # [N H W 3]
+                        colored_depth = torch.from_numpy(colored_depth_np)  # [N H W 3]
+                        colored_depth = einops.rearrange(colored_depth, "n h w c -> n c h w").float()  # [N 3 H W]
+
+                        if args.verbose:
+                            logging.info(f"RGB: shape={rgb.shape}, dtype={rgb.dtype}, range=[{rgb.min():.1f}, {rgb.max():.1f}]")
+                            logging.info(f"Depth: shape={colored_depth.shape}, dtype={colored_depth.dtype}, range=[{colored_depth.min():.1f}, {colored_depth.max():.1f}]")
+
+                        # Ensure same number of frames
+                        if rgb.shape[0] != colored_depth.shape[0]:
+                            num_frames = min(rgb.shape[0], colored_depth.shape[0])
+                            rgb = rgb[:num_frames]
+                            colored_depth = colored_depth[:num_frames]
+                            if args.verbose:
+                                logging.info(f"Adjusted to {num_frames} frames")
+
+                        # Ensure same H,W dimensions
+                        if rgb.shape[2:] != colored_depth.shape[2:]:
+                            from torchvision.transforms.functional import resize
+                            rgb = resize(rgb, list(colored_depth.shape[2:]), antialias=True)
+                            if args.verbose:
+                                logging.info(f"Resized RGB to match depth: {colored_depth.shape[2:]}")
+
+                        # Simple concatenation without gap for debugging
+                        concat_video = torch.cat([rgb, colored_depth], dim=3)  # Concatenate along width
+
+                        if args.verbose:
+                            logging.info(f"Concatenated: shape={concat_video.shape}, range=[{concat_video.min():.1f}, {concat_video.max():.1f}]")
+
+                        # Convert to uint8 numpy for video
+                        concat_video = torch.clamp(concat_video, 0, 255)
+                        concat_video_np = concat_video.byte().cpu().numpy()
+                        concat_video_np = einops.rearrange(concat_video_np, "n c h w -> n h w c")
+
+                        if args.verbose:
+                            logging.info(f"Final: shape={concat_video_np.shape}, dtype={concat_video_np.dtype}, range=[{concat_video_np.min()}, {concat_video_np.max()}]")
+
+                        # Write video
+                        save_to = output_dir.joinpath(f"{video_path.stem}_rgbd.mp4")
+                        write_video_from_numpy(
+                            frames=concat_video_np,
+                            output_path=save_to,
+                            fps=output_fps,
+                            crf=23,
+                            preset="medium",
+                            verbose=args.verbose,
                         )
-                        .int()
-                        .numpy()
-                        .astype(np.uint8)
-                    )
-                    concat_video = einops.rearrange(concat_video, "n c h w -> n h w c")
-                    save_to = output_dir.joinpath(f"{video_path.stem}_rgbd.mp4")
-                    write_video_from_numpy(
-                        frames=concat_video,
-                        output_path=save_to,
-                        fps=output_fps,
-                        crf=23,
-                        preset="medium",
-                        verbose=args.verbose,
-                    )
+                    except Exception as e:
+                        logging.error(f"Failed to create RGBD video: {e}")
+                        import traceback
+                        traceback.print_exc()
 
         logging.info(
             f"Finished. {len(video_iterable)} predictions are saved to {output_dir}"

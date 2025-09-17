@@ -68,7 +68,7 @@ class DepthAligner:
         indices = torch.tensor(index_list)
         return indices
 
-    def run(self, snippet_ls: List[torch.Tensor], dilations: List[int]):
+    def run(self, snippet_ls: List[torch.Tensor], dilations: List[int], seq_len: int = None, snippet_indices: List[List[List[int]]] = None):
         device = self.device
 
         # MPS optimization: Log timing if verbose
@@ -77,11 +77,20 @@ class DepthAligner:
 
         snippet_lenghts = [snippet.shape[1] for snippet in snippet_ls]
         gaps = [d - 1 for d in dilations]
-        sequence_length = (
-            len(snippet_ls[0])
-            + (snippet_lenghts[0] - 1) * gaps[0]
-            + (snippet_lenghts[0] - 1)
-        )
+
+        # If seq_len is provided, use it (correct for overlapping snippets)
+        # Otherwise, calculate based on snippet data
+        if seq_len is not None:
+            sequence_length = seq_len
+            if self.verbose:
+                print(f"Using provided sequence_length = {sequence_length}")
+        else:
+            # Fallback calculation for non-overlapping snippets
+            num_snippets = len(snippet_ls[0])
+            snippet_len = snippet_lenghts[0]
+            sequence_length = num_snippets * snippet_len - num_snippets + 1
+            if self.verbose:
+                print(f"WARNING: seq_len not provided, using fallback calculation = {sequence_length}")
 
         mn = min([snippet.min() for snippet in snippet_ls])  # type: ignore
         snippet_ls = [tmp - mn for tmp in snippet_ls]
@@ -99,11 +108,20 @@ class DepthAligner:
             tmp[:, :, :, :: self.factor, :: self.factor] for tmp in triplets_scaled
         ]
 
-        # Create triplet indices
-        indices_list = [
-            self.create_triplet_indices(sequence_length, g, w)
-            for g, w in zip(gaps, snippet_lenghts)
-        ]
+        # Create or use provided triplet indices
+        if snippet_indices is not None:
+            # Use the actual snippet indices from the pipeline
+            indices_list = []
+            for dilation_indices in snippet_indices:
+                # Convert list of lists to tensor
+                indices_tensor = torch.tensor(dilation_indices, dtype=torch.long)
+                indices_list.append(indices_tensor)
+        else:
+            # Fallback to old method (may not work correctly with overlapping snippets)
+            indices_list = [
+                self.create_triplet_indices(sequence_length, g, w)
+                for g, w in zip(gaps, snippet_lenghts)
+            ]
 
         scales, translations, loss_history = self.optimize(
             snippet_ls=triplets_scaled,
@@ -123,6 +141,15 @@ class DepthAligner:
         if self.verbose and device.type == "mps":
             t_end = time.time()
             logging.info(f"Co-alignment optimization took {t_end - t_start:.2f}s on MPS")
+
+        if self.verbose:
+            print(f"DEBUG: merged_scaled_triplets shape: {merged_scaled_triplets.shape}")
+            print(f"DEBUG: Expected {sequence_length} frames")
+
+        # Ensure we return the correct number of frames
+        if merged_scaled_triplets.shape[0] != sequence_length:
+            if self.verbose:
+                print(f"WARNING: Expected {sequence_length} frames but got {merged_scaled_triplets.shape[0]}")
 
         return (
             merged_scaled_triplets,
@@ -296,12 +323,24 @@ class DepthAligner:
         sequence_length: int,
         device: torch.device,
     ) -> torch.Tensor:
+        """
+        Merge overlapping snippet predictions.
+
+        The key insight: with stride=1 and snippet_len=3, for 5 frames we get:
+        - Snippet 0: frames [0,1,2]
+        - Snippet 1: frames [1,2,3]
+        - Snippet 2: frames [2,3,4]
+
+        Each snippet in snippet_ls[i] has shape (num_snippets, snippet_len, C, H, W)
+        indices_list[i] tells us which frames each snippet position corresponds to.
+        """
         snippet_ls = [a.to(device) for a in snippet_ls]
         dtype = snippet_ls[0].dtype
 
         scales = s_list
         translations = t_list
 
+        # Apply scale and translation
         A_scaled = [
             (
                 reshaped_tensor * s[:, None, None].to(dtype).to(device)
@@ -310,12 +349,60 @@ class DepthAligner:
             for reshaped_tensor, s, t in zip(snippet_ls, scales, translations)
         ]
 
+        # Get dimensions
+        C = A_scaled[0].shape[2] if len(A_scaled[0].shape) > 2 else 1
+        H = A_scaled[0].shape[3] if len(A_scaled[0].shape) > 3 else 1
+        W = A_scaled[0].shape[4] if len(A_scaled[0].shape) > 4 else 1
+
+        # Initialize accumulator for averaging overlapping predictions
+        frame_sum = {}  # frame_idx -> list of predictions
+
+        for i_dilation in range(len(A_scaled)):
+            # Each dilation level has its own set of snippets
+            snippets = A_scaled[i_dilation]  # shape: (num_snippets, snippet_len, C, H, W)
+            indices = indices_list[i_dilation]  # shape: (num_snippets, snippet_len)
+
+            for snippet_idx in range(len(indices)):
+                for pos_in_snippet in range(len(indices[snippet_idx])):
+                    frame_idx = int(indices[snippet_idx, pos_in_snippet].item())
+
+                    if 0 <= frame_idx < sequence_length:
+                        if frame_idx not in frame_sum:
+                            frame_sum[frame_idx] = []
+                        frame_sum[frame_idx].append(snippets[snippet_idx, pos_in_snippet])
+
+        # Average overlapping predictions and build sequence
         seq = []
         for i_frame in range(sequence_length):
-            tmp = []
-            for i_dilation in range(len(A_scaled)):
-                tmp.append(A_scaled[i_dilation][indices_list[i_dilation] == i_frame])
+            if i_frame in frame_sum:
+                # Average all predictions for this frame
+                frame_preds = torch.stack(frame_sum[i_frame])
+                avg_pred = frame_preds.mean(0)
+                seq.append(avg_pred)
+            else:
+                # This shouldn't happen if indices are correct
+                if self.verbose:
+                    print(f"Warning: Frame {i_frame} not found in any snippet")
+                # Create a zero frame as fallback
+                seq.append(torch.zeros((C, H, W), device=device, dtype=dtype))
 
-            seq.append(torch.cat(tmp).mean(0))
+        # Stack and reshape to match expected format
+        # The pipeline expects shape (N, 1, H, W) where N is number of frames
+        if seq:
+            # Stack all frames
+            result = torch.stack(seq)  # (seq_len, C, H, W) or (seq_len, H, W)
 
-        return torch.cat(seq)[:, None]
+            # Handle different tensor shapes
+            if len(result.shape) == 3:  # (seq_len, H, W)
+                # Add channel dimension
+                result = result.unsqueeze(1)  # (seq_len, 1, H, W)
+            elif len(result.shape) == 4 and result.shape[1] > 1:  # (seq_len, C>1, H, W)
+                # If there are multiple channels, we need to handle this differently
+                # For depth, we typically expect single channel
+                result = result.mean(dim=1, keepdim=True)  # Average channels to get (seq_len, 1, H, W)
+
+            # Result should now be (seq_len, 1, H, W)
+            return result
+        else:
+            # Return empty tensor in the expected format
+            return torch.zeros((sequence_length, 1, H, W), device=device, dtype=dtype)

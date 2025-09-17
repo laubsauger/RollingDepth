@@ -22,6 +22,7 @@
 import torch
 from torch.optim.adam import Adam
 import logging
+import time
 from typing import List, Tuple
 from tqdm import tqdm
 
@@ -40,6 +41,7 @@ class DepthAligner:
         verbose: bool = False,
         depth_loss_weight: float = 1.0,
         loss_scale=1.0,
+        quality_mode: str = "balanced",
     ):
         self.factor = factor  # Depth down-scale factor for s,t computation
         self.lmda = lmda  # Controls soft constraints on s and t
@@ -52,6 +54,7 @@ class DepthAligner:
         self.depth_loss_weight = depth_loss_weight
         self.loss_scale = loss_scale
         self.lmda3 = lmda3
+        self.quality_mode = quality_mode
 
     # Create indices to keep data structures simple
     def create_triplet_indices(self, sequence_length: int, gap: int, window_size: int):
@@ -67,6 +70,11 @@ class DepthAligner:
 
     def run(self, snippet_ls: List[torch.Tensor], dilations: List[int]):
         device = self.device
+
+        # MPS optimization: Log timing if verbose
+        if self.verbose and device.type == "mps":
+            t_start = time.time()
+
         snippet_lenghts = [snippet.shape[1] for snippet in snippet_ls]
         gaps = [d - 1 for d in dilations]
         sequence_length = (
@@ -112,6 +120,10 @@ class DepthAligner:
             device=torch.device("cpu"),
         )
 
+        if self.verbose and device.type == "mps":
+            t_end = time.time()
+            logging.info(f"Co-alignment optimization took {t_end - t_start:.2f}s on MPS")
+
         return (
             merged_scaled_triplets,
             scales,
@@ -148,20 +160,20 @@ class DepthAligner:
         loss_ls = []
 
         def closure():
+            # MPS optimization: Profile timing on first iteration
+            if device.type == "mps" and len(loss_ls) == 0 and self.verbose:
+                t_closure_start = time.time()
+
             A_scaled = [
                 reshaped_tensor * s + t
                 for reshaped_tensor, s, t in zip(snippet_ls, scales, translations)
             ]
 
-            M = torch.cat(
-                [torch.zeros(w, sequence_length, H * W, device=device) for w in windows]
-            )
-            M_depth = torch.cat(
-                [torch.zeros(w, sequence_length, H * W, device=device) for w in windows]
-            )
-            B = torch.cat(
-                [torch.zeros(w, sequence_length, H * W, device=device) for w in windows]
-            )
+            # MPS optimization: Pre-allocate tensors once
+            total_w = sum(windows)
+            M = torch.zeros(total_w, sequence_length, H * W, device=device)
+            M_depth = torch.zeros(total_w, sequence_length, H * W, device=device)
+            B = torch.zeros(total_w, sequence_length, H * W, device=device)
 
             for i, (scaled_tensor, indices, w) in enumerate(
                 zip(A_scaled, indices_list, windows)
@@ -179,8 +191,9 @@ class DepthAligner:
 
             # Calculate target
             with torch.no_grad():
-                target = summ.clone().detach()
-                target_depth = summ_depth.clone().detach()
+                # MPS optimization: Avoid unnecessary clone() operations
+                target = summ.detach()
+                target_depth = summ_depth.detach()
                 scale = target.abs().mean(-1, keepdim=True)
                 scale_depth = target_depth.abs().mean(-1, keepdim=True)
 
@@ -204,9 +217,68 @@ class DepthAligner:
         iterable = range(self.num_iterations)
         if self.verbose:
             iterable = tqdm(iterable, desc="Co-align snippets", leave=False)
+
+        # MPS optimization: Use more efficient gradient clearing and early stopping
+        prev_loss = float('inf')
+        patience_counter = 0
+
+        # Configurable early stopping based on quality preference
+        quality_mode = self.quality_mode
+
+        # Set defaults
+        max_iterations = self.num_iterations
+
+        if quality_mode == 'fast':
+            # Aggressive early stopping (~500-600 iterations)
+            patience = 30 if device.type == "mps" else 50
+            min_iterations = 500 if device.type == "mps" else 1000
+            loss_threshold = 1e-4 if device.type == "mps" else 1e-5
+            max_iterations = 700 if device.type == "mps" else 1000
+        elif quality_mode == 'balanced':
+            # Middle ground - force stop at 1000-1200 iterations
+            patience = 50 if device.type == "mps" else 100
+            min_iterations = 800 if device.type == "mps" else 1200
+            loss_threshold = 5e-5 if device.type == "mps" else 1e-5
+            max_iterations = 1200 if device.type == "mps" else 1500
+        else:  # 'quality' or default
+            # High quality - full iterations
+            patience = 200 if device.type == "mps" else 300  # Very high patience
+            min_iterations = 1500 if device.type == "mps" else 1800
+            loss_threshold = 1e-6 if device.type == "mps" else 1e-7  # Very strict
+            max_iterations = self.num_iterations  # Use full 2000
+
+        if self.verbose and device.type == "mps":
+            logging.info(f"Co-alignment quality mode: {quality_mode} (min_iter={min_iterations}, max_iter={max_iterations}, patience={patience})")
+
         for i in iterable:
-            optimizer.zero_grad()
+            # Check if we've reached max iterations for this quality mode
+            if i >= max_iterations:
+                if self.verbose:
+                    logging.info(f"Reached max iterations ({max_iterations}) for {quality_mode} mode")
+                break
+
+            if device.type == "mps":
+                optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
+            else:
+                optimizer.zero_grad()
             optimizer.step(closure)
+
+            # Sync every 100 iterations on MPS to free memory
+            if i % 100 == 0 and device.type == "mps" and hasattr(torch.mps, 'synchronize'):
+                torch.mps.synchronize()
+
+            # Early stopping - check convergence
+            if i > min_iterations and len(loss_ls) > 0:
+                current_loss = loss_ls[-1][0]
+                if abs(current_loss - prev_loss) < loss_threshold:
+                    patience_counter += 1
+                    if patience_counter >= patience:
+                        if self.verbose:
+                            logging.info(f"Early stopping at iteration {i} (converged)")
+                        break
+                else:
+                    patience_counter = 0
+                prev_loss = current_loss
 
             if i % 10 == 0 and self.verbose:
                 logging.debug(

@@ -151,6 +151,18 @@ def write_video_from_numpy(
     n_frames, height, width, _ = frames.shape
 
     # Try to determine codec from output format if not specified
+    # Ensure dimensions are even for video encoding (required by most codecs)
+    if height % 2 != 0:
+        height = height - 1
+        frames = frames[:, :height, :, :]
+        if verbose:
+            logging.debug(f"Adjusted height to {height} for video encoding")
+    if width % 2 != 0:
+        width = width - 1
+        frames = frames[:, :, :width, :]
+        if verbose:
+            logging.debug(f"Adjusted width to {width} for video encoding")
+
     if codec is None:
         codecs_to_try = ["libx264", "h264", "mpeg4", "mjpeg"]
     else:
@@ -238,6 +250,11 @@ def concatenate_videos_horizontally_torch(
     # Get target size
     N, C, H1, W1 = video1.shape
 
+    # Ensure height is divisible by 2 for video encoding
+    if H1 % 2 != 0:
+        H1 = H1 - 1
+        video1 = video1[:, :, :H1, :]
+
     # Resize video2 to match height of video1
     video2_resized = resize(video2, [H1, W1], antialias=True)
 
@@ -257,8 +274,5 @@ def concatenate_videos_horizontally_torch(
     else:
         # Concatenate without gap
         concatenated = torch.cat([video1, video2_resized], dim=3)
-
-    # Concatenate along width dimension
-    concatenated = torch.cat([video1, video2_resized], dim=3)
 
     return concatenated

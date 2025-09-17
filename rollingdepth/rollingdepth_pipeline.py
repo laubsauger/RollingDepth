@@ -19,6 +19,7 @@
 # ---------------------------------------------------------------------------------
 
 import logging
+import time
 from os import PathLike
 from typing import Dict, List, Union
 
@@ -33,7 +34,7 @@ from transformers import CLIPTextModel, CLIPTokenizer
 def clear_memory_cache():
     """Clear memory cache based on available device type (CUDA/MPS)."""
     if torch.cuda.is_available():
-        clear_memory_cache()
+        torch.cuda.empty_cache()
     elif torch.backends.mps.is_available() and hasattr(torch.mps, 'empty_cache'):
         torch.mps.empty_cache()
 
@@ -82,6 +83,16 @@ class RollingDepthPipeline(DiffusionPipeline):
         self.empty_text_embed: torch.Tensor = None  # type: ignore
 
         logging.debug(f"Pipeline initialized: {type(self)}")
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        """Override from_pretrained to handle dtype parameter properly."""
+        # Handle both 'dtype' and 'torch_dtype' for compatibility
+        if 'dtype' in kwargs and 'torch_dtype' not in kwargs:
+            kwargs['torch_dtype'] = kwargs.pop('dtype')
+
+        # Call parent's from_pretrained with torch_dtype
+        return super().from_pretrained(pretrained_model_name_or_path, **kwargs)
 
     @torch.no_grad()
     def __call__(
@@ -271,9 +282,13 @@ class RollingDepthPipeline(DiffusionPipeline):
         input_frames = input_frames.to(self.dtype).to(device)
 
         # Encode RGB frames
+        t_encode_start = time.time()
         rgb_latent = self.encode_rgb(
             input_frames, max_batch_size=max_vae_bs, verbose=verbose
         )
+        t_encode_end = time.time()
+        if verbose:
+            logging.info(f"VAE encoding took {t_encode_end - t_encode_start:.2f}s")
 
         # Empty text embedding
         if self.empty_text_embed is None:
@@ -296,6 +311,7 @@ class RollingDepthPipeline(DiffusionPipeline):
         init_noise = einops.repeat(init_noise, "1 c h w -> B n c h w", n=seq_len, B=B)
 
         # Get snippets
+        t_inference_start = time.time()
         snippet_pred_ls = self.init_snippet_infer(
             rgb_latent=rgb_latent,
             init_noise=init_noise,
@@ -308,8 +324,12 @@ class RollingDepthPipeline(DiffusionPipeline):
             unload_snippet=unload_snippet,
             verbose=verbose,
         )
+        t_inference_end = time.time()
+        if verbose:
+            logging.info(f"Initial inference took {t_inference_end - t_inference_start:.2f}s")
 
         # ----------------- Co-alignment -----------------
+        t_align_start = time.time()
         coalign_kwargs = {} if coalign_kwargs is None else coalign_kwargs
         depth_aligner = DepthAligner(
             verbose=verbose,
@@ -324,6 +344,10 @@ class RollingDepthPipeline(DiffusionPipeline):
         depth_coaligned -= depth_coaligned.min()
         depth_coaligned /= depth_coaligned.max()
         depth_coaligned = depth_coaligned * 2.0 - 1.0
+
+        t_align_end = time.time()
+        if verbose:
+            logging.info(f"Co-alignment took {t_align_end - t_align_start:.2f}s")
 
         clear_memory_cache()
 
@@ -479,12 +503,11 @@ class RollingDepthPipeline(DiffusionPipeline):
         dilation_end: int,
         stride: int,
     ) -> List[List[int]]:
-        gap_start = dilation_start - 1
-        gap_end = dilation_end - 1
+        gap_start = max(0, dilation_start - 1)
+        gap_end = max(0, dilation_end - 1)
         assert (
             gap_start >= gap_end
-        ), f"expect gap_start > gap_end, but got {gap_start} and {gap_end}"
-        assert gap_start >= 0 and gap_end >= 0
+        ), f"expect gap_start >= gap_end, but got {gap_start} and {gap_end}"
 
         total_step = len(timesteps)
         gap_cur = int((1 - (i_step) / total_step) * (gap_start - gap_end) + gap_end)
@@ -648,8 +671,15 @@ class RollingDepthPipeline(DiffusionPipeline):
     ) -> torch.Tensor:
         assert depth_latent.shape == rgb_latent.shape
         num_view = rgb_latent.shape[1]
+
+        # MPS optimization: ensure contiguous after rearrange
         rgb_latent = einops.rearrange(rgb_latent, "b n c h w -> (b n) c h w")
         depth_latent = einops.rearrange(depth_latent, "b n c h w -> (b n) c h w")
+
+        # Only make contiguous for MPS - CUDA doesn't need it
+        if rgb_latent.device.type == "mps":
+            rgb_latent = rgb_latent.contiguous()
+            depth_latent = depth_latent.contiguous()
 
         # Concat rgb and depth latents
         unet_input = torch.cat([rgb_latent, depth_latent], dim=1)  # [N, 8, h, w]
